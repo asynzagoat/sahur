@@ -1,0 +1,32 @@
+sahur - setup (MTC / [REDLINE] Multicrew Tank Combat, Matcha)
+================================================================
+
+You need: Matcha, working on your PC. Nothing else to download.
+
+1. START IT
+   - Open Roblox and join [REDLINE] Multicrew Tank Combat.
+   - Start Matcha and attach it to Roblox like you normally do.
+   - In Matcha's script box, run this one line:
+
+        loadstring(game:HttpGet("https://raw.githubusercontent.com/asynzagoat/sahur/main/sahur.lua"))()
+
+   A "loaded" message shows up in the corner. It always loads the newest version.
+
+   (Offline instead: put sahur.lua in Matcha's "workspace" folder, e.g. C:\matcha\workspace\sahur.lua,
+    and run   loadstring(readfile("sahur.lua"))()   )
+
+2. USE IT
+   - Left Alt opens/closes the menu.
+   - Aimbot: turn on "Enabled" in the Aimbot tab, then HOLD Mouse Button 5 (the front side button)
+     while looking at an enemy tank. It locks the tank closest to your crosshair inside the red ring.
+     "Target" picks the part: Ammo (biggest rack), Nearest ammo (rack closest to your crosshair),
+     Engine, Crew or Center. You can change the key in the menu.
+   - Leave the toggles marked (DEV TEST) as they are.
+   - ESP tab: boxes (Full / Corners / Filled), names, distance, reload status (loaded round type or
+     UNLOADED), chams for ammo / engine / crew / barrel / tracks. Every colour has an opacity bar.
+   - Config tab: save/load your settings. Settings tab: language (EN/PT) and menu key.
+
+3. GOOD TO KNOW
+   - New match / new server: it reloads itself automatically. If it ever doesn't, run the line again.
+   - To turn everything off without leaving the game, run:   _G.Sahur.stop()
+   - Running the start line again restarts it cleanly (no need to stop first).
