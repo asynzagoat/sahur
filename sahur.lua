@@ -2705,7 +2705,7 @@ local Workspace = workspace
 local clock = os.clock
 local BUILD_BUDGET = 0.004
 local RR_PER_TICK  = 1
-local TICK         = 0.1
+local TICK         = 0.2
 local TEAM_EVERY   = 8
 local RESCAN_EVERY = 2
 local OCC_R        = 12
@@ -2739,6 +2739,9 @@ local function bb(msg)
 end
 R.bb = bb
 R.tr = tr
+local perf = {}
+function _G.SahurPerfAdd(name, t0) perf[name] = (perf[name] or 0) + (clock() - t0) * 1000 end
+R.perf = perf
 local RT = {}
 pcall(function()
     local src = (_G.SahurSrc and _G.SahurSrc["sahur/data/roundtypes.lua"]) or readfile("sahur/data/roundtypes.lua")
@@ -2931,18 +2934,32 @@ local function build(v)
     return e
 end
 local playerPos = {}
+local PLAYER_LIST, PLAYER_POS = 6, 2
+local hrpList, hrpAt, myName = {}, -1e9, nil
 local function refreshPlayers()
-    local lp = Players.LocalPlayer
-    local out = {}
-    local ok, plist = pcall(function() return Players:GetPlayers() end)
-    if ok and plist then
-        for _, p in ipairs(plist) do
-            if p ~= lp and p.Name ~= (lp and lp.Name) then
-                local ch = p.Character
-                local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-                if hrp then local okp, pos = pcall(function() return hrp.Position end) if okp and pos then out[#out + 1] = pos end end
+    local now = clock()
+    if now - hrpAt >= PLAYER_LIST then
+        hrpAt = now
+        local lp = Players.LocalPlayer
+        if not myName then local okm, mn = pcall(function() return lp.Name end); myName = okm and mn or nil end
+        local list = {}
+        local ok, plist = pcall(function() return Players:GetPlayers() end)
+        if ok and plist then
+            for _, p in ipairs(plist) do
+                local okn, nm = pcall(function() return p.Name end)
+                if okn and nm ~= myName then
+                    local okh, hrp = pcall(function() local ch = p.Character; return ch and ch:FindFirstChild("HumanoidRootPart") end)
+                    if okh and hrp then list[#list + 1] = hrp end
+                end
             end
         end
+        hrpList = list
+    end
+    local out = {}
+    for i = 1, #hrpList do
+        local h = hrpList[i]
+        local okp, pos = pcall(function() return h.Position end)
+        if okp and pos then out[#out + 1] = pos end
     end
     playerPos = out
 end
@@ -3030,16 +3047,30 @@ function R.start()
     local lastMapCheck, lastMapKey = 0, nil
     local failAt = {}
     local lastBeat = 0
+    local inTankObj, inTankAt, svObj, svAt = nil, -1e9, nil, -1e9
+    local buildQ = {}
+    local sec, secT = {}, 0
+    local function lap(name) local t = clock(); sec[name] = (sec[name] or 0) + (t - secT) * 1000; secT = t end
+    R.sec = sec
     task.spawn(function()
         while loopRunning do
             local t0 = clock()
+            secT = t0
             local okT, errT = pcall(function()
                 local lp = Players.LocalPlayer
-                local it = lp and lp:FindFirstChild("InTank")
-                local mv = it and it.Value
+                if not inTankObj or t0 - inTankAt > 5 then
+                    inTankAt = t0
+                    local okI, io = pcall(function() return lp and lp:FindFirstChild("InTank") end)
+                    inTankObj = okI and io or nil
+                end
+                local it = inTankObj
+                local okV, mv = pcall(function() return it and it.Value end)
+                if not okV then mv = nil; inTankObj = nil end
                 local okA, ma = pcall(function() return mv and mv.Address end)
                 R.myAddr = (okA and ma) or nil
-                if t0 - lastPlayers > 1 then refreshPlayers(); lastPlayers = t0 end
+                lap("me")
+                if t0 - lastPlayers > PLAYER_POS then refreshPlayers(); lastPlayers = t0 end
+                lap("players")
                 if t0 - lastMapCheck >= 1 then
                     lastMapCheck = t0
                     local okM, mapName = pcall(function() return Workspace.Map.CurrentlyLoaded.Value end)
@@ -3049,19 +3080,45 @@ function R.start()
                         bb("map change " .. key)
                         R.list, R.byAddr, R.myTank = {}, {}, nil
                         for k in pairs(failAt) do failAt[k] = nil end
+                        buildQ, svObj, inTankObj = {}, nil, nil
                         lastCount, pending = -1, true
                         R.epoch = (R.epoch or 0) + 1
                         R.stats.mapChanges = (R.stats.mapChanges or 0) + 1
                     end
                     lastMapKey = key
                 end
-                local sv = Workspace:FindFirstChild("SpawnedVehicles")
+                lap("map")
+                if not svObj or t0 - svAt > 5 then
+                    svAt = t0
+                    local okS, so = pcall(function() return Workspace:FindFirstChild("SpawnedVehicles") end)
+                    svObj = okS and so or nil
+                end
+                local sv = svObj
                 local ok, kids = pcall(function() return sv and sv:GetChildren() end)
+                if not ok then svObj = nil end
                 if not ok or not kids then R.list = {}; return end
                 if #kids > 400 then R.stats.tickErr = "SpawnedVehicles returned " .. #kids .. " children (garbage read?)"; return end
                 for fa, at in pairs(failAt) do if t0 >= at then failAt[fa] = nil; if R.byAddr[fa] == false then R.byAddr[fa] = nil end end end
                 local built = false
-                if pending or #kids ~= lastCount or t0 - lastRescan >= RESCAN_EVERY then
+                lap("kids")
+                local tb = clock()
+                while #buildQ > 0 and (not built or clock() - tb < BUILD_BUDGET) do
+                    local q = table.remove(buildQ, 1)
+                    if R.byAddr[q.a] == nil then
+                        local okB, res = pcall(build, q.v)
+                        local e
+                        if okB then e = res else e = false; R.stats.buildErr = tostring(res) end
+                        if e then
+                            e.addr = q.a
+                            local okL, errL = pcall(refreshLive, e); if not okL then R.stats.liveErr = tostring(errL) end
+                            R.list[#R.list + 1] = e
+                        end
+                        R.byAddr[q.a] = e
+                        if e == false then failAt[q.a] = t0 + 2 end
+                        built = true
+                    end
+                end
+                if #buildQ == 0 and (pending or #kids ~= lastCount or t0 - lastRescan >= RESCAN_EVERY) then
                     lastCount, lastRescan, pending = #kids, t0, false
                     local seen, list = {}, {}
                     for _, v in ipairs(kids) do
@@ -3069,24 +3126,15 @@ function R.start()
                         if okv and a then
                             seen[a] = true
                             local e = R.byAddr[a]
-                            if e == nil then
-                                if clock() - t0 < BUILD_BUDGET then
-                                    local okB, res = pcall(build, v)
-                                    if okB then e = res else e = false; R.stats.buildErr = tostring(res) end
-                                    if e then e.addr = a; local okL, errL = pcall(refreshLive, e); if not okL then R.stats.liveErr = tostring(errL) end end
-                                    R.byAddr[a] = e
-                                    if e == false then failAt[a] = t0 + 2 end
-                                    built = true
-                                else
-                                    pending = true
-                                end
-                            end
-                            if e then list[#list + 1] = e end
+                            if e == nil then buildQ[#buildQ + 1] = { a = a, v = v }
+                            elseif e then list[#list + 1] = e end
                         end
                     end
                     for a in pairs(R.byAddr) do if not seen[a] then R.byAddr[a] = nil end end
                     R.list = list
                 end
+                if #buildQ > 0 then pending = true end
+                lap(built and "build" or "rescan")
                 R.myTank = R.myAddr and R.byAddr[R.myAddr] or nil
                 local list = R.list
                 local n = #list
@@ -3099,6 +3147,7 @@ function R.start()
                             if e.stale then R.byAddr[e.addr] = nil; pending = true end
                         end
                     end
+                    lap("live")
                     if R.attrOK then
                         for _, e in ipairs(list) do
                             if not e.classTried then
@@ -3109,6 +3158,7 @@ function R.start()
                                 break
                             end
                         end
+                        lap("attr")
                     end
                 end
             end)
@@ -3119,12 +3169,15 @@ function R.start()
             if t0 - lastBeat >= 2 then
                 lastBeat = t0
                 local A, H = _G.SahurAim, _G.SahurHeli
-                bb(string.format("hb tanks=%d me=%s tick=%.1fms max=%.1f aimF=%s lock=%s heliF=%s err=%s",
+                local parts = {}
+                for k, v in pairs(sec) do parts[#parts + 1] = string.format("%s=%.0f", k, v); sec[k] = 0 end
+                for k, v in pairs(perf) do parts[#parts + 1] = string.format("%s=%.0f", k:upper(), v); perf[k] = 0 end
+                bb(string.format("hb tanks=%d me=%s tick=%.1fms max=%.1f aimF=%s lock=%s heliF=%s err=%s sec[%s]",
                     #R.list, tostring(R.myTank and R.myTank.name), ms, R.stats.maxTickMs,
                     tostring(A and A._frames), tostring(A and A._why),
-                    tostring(H and H._frames), tostring(R.stats.tickErr)))
+                    tostring(H and H._frames), tostring(R.stats.tickErr), table.concat(parts, " ")))
             end
-            task.wait(pending and 0.05 or TICK)
+            task.wait(pending and 0.1 or TICK)
         end
     end)
     return R
@@ -3139,7 +3192,7 @@ return R
 ["sahur/modules/esp.lua"] = [=[
 local ESP = {
     Config = {
-        Enabled = true, TeamCheck = false, Box = true, Names = true, Class = true,
+        Enabled = true, TeamCheck = true, Box = true, Names = true, Class = true,
         Distance = true, CrewCount = false, MaxDist = 4000,
         Reload = true,
         BoxStyle = "Full",
@@ -3165,7 +3218,7 @@ local COL_RELOAD = Color3.fromRGB(255, 210, 90)
 local ALPHA = { Box = 1, Name = 1, Distance = 1, Crew = 1, Reload = 1 }
 local FILL_A = 0.5
 local CORNER = 0.25
-local RL_EVERY   = 0.25
+local RL_EVERY   = 0.5
 local KIND_COL = { eng = Color3.fromRGB(255, 140, 0), ammo = Color3.fromRGB(255, 40, 40), crew = Color3.fromRGB(90, 200, 255),
     barrel = Color3.fromRGB(255, 230, 90), track = Color3.fromRGB(170, 170, 170) }
 local KIND_A   = { eng = 0.4, ammo = 0.4, crew = 0.4, barrel = 0.4, track = 0.4 }
@@ -3228,22 +3281,85 @@ ESP.colors = function() return { Box = COL_BOX, Name = COL_NAME, Distance = COL_
 ESP.alphas = function() return { Box = ALPHA.Box, Name = ALPHA.Name, Distance = ALPHA.Distance, Crew = ALPHA.Crew,
     Reload = ALPHA.Reload, Engine = KIND_A.eng, Ammo = KIND_A.ammo, CrewChams = KIND_A.crew, Barrel = KIND_A.barrel, Tracks = KIND_A.track } end
 local PTS, FRONT = {}, {}
+local PJ = { ok = false, cx = 0, cy = 0, k = 1, W = 1920, H = 1080,
+    px = 0, py = 0, pz = 0, rx = 1, ry = 0, rz = 0, ux = 0, uy = 1, uz = 0, lx = 0, ly = 0, lz = -1 }
+local vpAt, vpW, vpH = -1e9, 1920, 1080
+local function calibrate(cam, ccf, now)
+    PJ.ok = false
+    if now - vpAt > 1 then
+        local okv, vp = pcall(function() return cam.ViewportSize end)
+        if okv and vp then vpW, vpH, vpAt = vp.X, vp.Y, now end
+    end
+    local okf, fov = pcall(function() return cam.FieldOfView end)
+    if not okf or not fov then return end
+    local pos, r, u, l = ccf.Position, ccf.RightVector, ccf.UpVector, ccf.LookVector
+    PJ.px, PJ.py, PJ.pz = pos.X, pos.Y, pos.Z
+    PJ.rx, PJ.ry, PJ.rz = r.X, r.Y, r.Z
+    PJ.ux, PJ.uy, PJ.uz = u.X, u.Y, u.Z
+    PJ.lx, PJ.ly, PJ.lz = l.X, l.Y, l.Z
+    PJ.W, PJ.H = vpW, vpH
+    local th = math.tan(math.rad(fov) / 2)
+    local c = pos + l * 500
+    local w0, on0 = WTS(c)
+    local w1, on1 = WTS(c + r * (250 * th))
+    if on0 and on1 and w0 and w1 and th > 0 then
+        PJ.cx, PJ.cy, PJ.k = w0.X, w0.Y, (w1.X - w0.X) / (0.5 * th)
+    else
+        PJ.cx, PJ.cy, PJ.k = vpW / 2, vpH / 2, (vpH / 2) / th * 0.988
+    end
+    PJ.ok = PJ.k > 1
+end
 local function projectBox(cf, corners, pts, front)
     local pos = cf.Position; local rv, uv, lv = cf.RightVector, cf.UpVector, cf.LookVector
-    local px, py, pz = pos.X, pos.Y, pos.Z
+    local px, py, pz = pos.X - PJ.px, pos.Y - PJ.py, pos.Z - PJ.pz
     local rx, ry, rz = rv.X, rv.Y, rv.Z
     local ux, uy, uz = uv.X, uv.Y, uv.Z
     local lx, ly, lz = lv.X, lv.Y, lv.Z
+    local crx, cry, crz, cux, cuy, cuz, clx, cly, clz = PJ.rx, PJ.ry, PJ.rz, PJ.ux, PJ.uy, PJ.uz, PJ.lx, PJ.ly, PJ.lz
+    local k, cx, cy, W, H = PJ.k, PJ.cx, PJ.cy, PJ.W, PJ.H
     local anyVis, minY, topX = false, huge, 0
     for c = 1, 8 do
         local lc = corners[c]; local ax, ay, az = lc[1], lc[2], lc[3]
-        local sp, vis = WTS(V3(px + rx*ax + ux*ay - lx*az, py + ry*ax + uy*ay - ly*az, pz + rz*ax + uz*ay - lz*az))
-        if vis and sp then
-            pts[c] = V2(floor(sp.X + 0.5), floor(sp.Y + 0.5)); front[c] = true; anyVis = true
-            if sp.Y < minY then minY = sp.Y; topX = sp.X end
-        else front[c] = false end
+        local dx = px + rx*ax + ux*ay - lx*az
+        local dy = py + ry*ax + uy*ay - ly*az
+        local dz = pz + rz*ax + uz*ay - lz*az
+        local z = dx*clx + dy*cly + dz*clz
+        local vis = false
+        if z > 0.1 then
+            local sx = cx + k * (dx*crx + dy*cry + dz*crz) / z
+            local sy = cy - k * (dx*cux + dy*cuy + dz*cuz) / z
+            if sx >= 0 and sx <= W and sy >= 0 and sy <= H then
+                vis = true
+                pts[c] = V2(floor(sx + 0.5), floor(sy + 0.5)); front[c] = true; anyVis = true
+                if sy < minY then minY = sy; topX = sx end
+            end
+        end
+        if not vis then front[c] = false end
     end
     return anyVis, minY, topX
+end
+local function poseOf(obj, readFn, now, iv, feedE)
+    local c = obj._ecf
+    if c and now - obj._ecfT < iv then
+        local v = obj._ev
+        if v then
+            local ok, c2 = pcall(function() return c + v * (now - obj._ecfT) end)
+            if ok and c2 then return c2 end
+        end
+        return c
+    end
+    local cf = readFn()
+    if c and obj._ecfT then
+        local dt = now - obj._ecfT
+        local v = (dt > 0.01 and dt < 0.6) and (cf.Position - c.Position) / dt or nil
+        obj._ev = (v and v.Magnitude < 150) and v or nil
+    end
+    obj._ecf, obj._ecfT = cf, now
+    if feedE then
+        local A = _G.SahurAim
+        if A and A.feed then pcall(A.feed, feedE, cf.Position, now) end
+    end
+    return cf
 end
 local function drawEdges(lines, pts, front)
     for j = 1, 12 do
@@ -3303,11 +3419,13 @@ local lastSlots, lastMods = 0, 0
 local drawn, modDrawn = 0, 0
 local camPos, camLook = V3(0, 0, 0), V3(0, 0, -1)
 local chamsOn = false
-local function drawTank(e)
-    local cf = e.mass.CFrame
+local function drawTank(e, now)
+    local mass = e.mass
+    local cf = poseOf(e, function() return mass.CFrame end, now, e._eIv or 0, e)
     local mpos = cf.Position
     local rel = mpos - camPos
     local d = rel.Magnitude * STUDS_TO_M
+    e._eIv = (d < 250 and 0) or (d < 1000 and 0.1) or 0.25
     if d > Config.MaxDist then return end
     if rel:Dot(camLook) < -30 then return end
     local anyVis, minY, topX = projectBox(cf, e.massCorners, PTS, FRONT)
@@ -3377,7 +3495,10 @@ local function drawTank(e)
             if Config[KIND_ON[kind] or ""] then
                 local mv
                 if m.fixed then mv = projectBox(cf, m.corners, PTS, FRONT)
-                else mv = projectBox(m.part.CFrame, m.corners, PTS, FRONT) end
+                else
+                    local part = m.part
+                    mv = projectBox(poseOf(m, function() return part.CFrame end, now, e._eIv or 0), m.corners, PTS, FRONT)
+                end
                 if mv then
                     modDrawn = modDrawn + 1
                     local ms = modSlots[modDrawn] or newModSlot()
@@ -3397,13 +3518,16 @@ end
 function ESP.start()
     if loopRunning then return ESP end
     loopRunning = true
-    conn = RunService.RenderStepped:Connect(function()
+    local function frameBody()
         local R = _G.SahurTanks
         if not Config.Enabled or not R then hideAll(); return end
         local cam = Workspace.CurrentCamera
         local okc, ccf = pcall(function() return cam.CFrame end)
         if not okc or not ccf then hideAll(); return end
         camPos, camLook = ccf.Position, ccf.LookVector
+        local now = os.clock()
+        calibrate(cam, ccf, now)
+        if not PJ.ok then hideAll(); return end
         chamsOn = Config.Engine or Config.Ammo or Config.Crew or Config.Barrel or Config.Tracks
         local list, myAddr, teamCheck = R.list, R.myAddr, Config.TeamCheck
         drawn, modDrawn = 0, 0
@@ -3412,14 +3536,15 @@ function ESP.start()
             local e = list[ti]
             if e.addr ~= myAddr and (not teamCheck or e.enemy) then
                 local before = drawn
-                local ok = pcall(drawTank, e)
+                local ok = pcall(drawTank, e, now)
                 if not ok and drawn > before then hideSlot(slots[drawn]) end
             end
         end
         for i = drawn + 1, lastSlots do hideSlot(slots[i]) end
         for i = modDrawn + 1, lastMods do hideMod(modSlots[i]) end
         lastSlots, lastMods = drawn, modDrawn
-    end)
+    end
+    conn = RunService.RenderStepped:Connect(function() local t0 = os.clock(); frameBody(); local P = _G.SahurPerfAdd; if P then P("esp", t0) end end)
     return ESP
 end
 function ESP.stop()
@@ -3894,6 +4019,7 @@ local function clampElevation(p)
 end
 local RET_HALF = 13
 local retFrame, retEpoch = nil, -1
+local retVpAt, retVpW, retVpH = -1e9, nil, nil
 local retParams, retParamsFor = nil, nil
 local SIGHT_FOV, SIGHT_DIST = 35, 12
 local sightFrame, sightVal = -1, false
@@ -3927,7 +4053,15 @@ local function reticlePoint()
     if not retFrame then return nil end
     local ok, p = pcall(function() return retFrame.AbsolutePosition end)
     if not ok or not p or (p.X <= 1 and p.Y <= 1) then return nil end
-    return p.X + RET_HALF, p.Y + RET_HALF
+    local now = clock()
+    if now - retVpAt > 1 then
+        retVpAt = now
+        local okv, vp = pcall(function() return workspace.CurrentCamera.ViewportSize end)
+        if okv and vp then retVpW, retVpH = vp.X, vp.Y end
+    end
+    local half = retVpW and (retVpW / 2 - p.X) or -1
+    if half < 5 or half > 60 then half = RET_HALF * ((retVpH or 1080) / 1080) end
+    return p.X + half, p.Y + half
 end
 local addonCache, addonCacheN = {}, 0
 local function inAddons(inst)
@@ -4186,12 +4320,20 @@ local function selErr(pt)
     return boreErr(pt)
 end
 local lastWarm = -1e9
+local WARM_FED, WARM_MAX = 0.3, 6
+local warmRR = 0
+function Aim.feed(e, pos, now) e._fedAt = now; trackVel(e, pos, now) end
 local function warmTrack(R, now)
     if now - lastWarm < SELECT_EVERY then return end
     lastWarm = now
     local myAddr = R.myAddr
-    for _, e in ipairs(R.list) do
-        if eligible(e, myAddr) then
+    local list, n, reads = R.list, #R.list, 0
+    for _ = 1, n do
+        if reads >= WARM_MAX then break end
+        warmRR = warmRR % n + 1
+        local e = list[warmRR]
+        if e and eligible(e, myAddr) and now - (e._fedAt or -1e9) > WARM_FED then
+            reads = reads + 1
             local okc, massCF = pcall(function() return e.mass.CFrame end)
             if okc and massCF then trackVel(e, massCF.Position, now) end
         end
@@ -4309,7 +4451,7 @@ function Aim.start()
             task.wait(0.3)
         end
     end)
-    conn = RunService.RenderStepped:Connect(function(dt)
+    local function frameBody(dt)
         dt = dt or (1 / 240)
         Aim._frames = (Aim._frames or 0) + 1
         local R = _G.SahurTanks
@@ -4567,7 +4709,8 @@ function Aim.start()
             readout.Text = string.format("%s  %dm%s%s", tostring(d.tank or "?"), d.distM or 0, rt and ("  " .. rt) or "", elevClamped and "  LIMIT" or "")
             readout.Position = Vector2.new(ring.x, ring.y + Config.FOV + 6); readout.Visible = true
         else readout.Visible = false end
-    end)
+    end
+    conn = RunService.RenderStepped:Connect(function(dt) local t0 = os.clock(); frameBody(dt); local P = _G.SahurPerfAdd; if P then P("aim", t0) end end)
     return Aim
 end
 function Aim.stop()
@@ -4723,7 +4866,7 @@ function Misc.start()
             task.wait(0.3)
         end
     end)
-    conn = RunService.RenderStepped:Connect(function()
+    local function frameBody()
         if not Misc.Config.BarrelLine or not muzzle then hideAll(); return end
         local ok, cf = pcall(function() return muzzle.CFrame end)
         if not ok or not cf then hideAll(); return end
@@ -4741,7 +4884,8 @@ function Misc.start()
         else
             line.Visible = false
         end
-    end)
+    end
+    conn = RunService.RenderStepped:Connect(function() local t0 = os.clock(); frameBody(); local P = _G.SahurPerfAdd; if P then P("misc", t0) end end)
     return Misc
 end
 function Misc.debug()
@@ -4974,7 +5118,7 @@ function Heli.start()
             task.wait(0.25)
         end
     end)
-    conn = RunService.RenderStepped:Connect(function()
+    local function frameBody()
         Heli._frames = (Heli._frames or 0) + 1
         if not Config.Enabled or not veh or not active or isGuided or not speedMs then hideAll(); return end
         local now = clock()
@@ -5004,7 +5148,8 @@ function Heli.start()
             end
         end
         if not shown then hideMarker(); txt.Visible = false end
-    end)
+    end
+    conn = RunService.RenderStepped:Connect(function() local t0 = os.clock(); frameBody(); local P = _G.SahurPerfAdd; if P then P("heli", t0) end end)
     return Heli
 end
 function Heli.debug()
@@ -5080,48 +5225,49 @@ local function findContainers()
     local ok, f = pcall(function() return game:GetService("ReplicatedStorage").PHRST.Shells:FindFirstChild("PhysicalBullets") end)
     if ok and f then containers[#containers + 1] = f end
 end
+local lastN = {}
+local TAIL_BACK, TRACK_IDLE, TRACK_MAXAGE = 4, 1.5, 40
 local function scan()
     local now = clock()
-    local seen = {}
-    for _, cont in ipairs(containers) do
+    for ci, cont in ipairs(containers) do
         local ok, kids = pcall(function() return cont:GetChildren() end)
         if ok and kids then
-            for i = 1, #kids do
+            local n, prev = #kids, lastN[ci]
+            local from = (prev and n >= prev) and (prev + 1 - TAIL_BACK) or (n - 12)
+            if from < 1 then from = 1 end
+            lastN[ci] = n
+            for i = from, n do
                 local c = kids[i]
                 local okn, nm = pcall(function() return c.Name end)
                 local cat = okn and nm and catOf(nm)
                 if cat then
-                    local oka, a = pcall(function() return c.Address end)
-                    local t
-                    if oka and a then
-                        seen[a] = true
-                        t = tracks[a]
-                        if not t then
-                            local cn = c.ClassName
-                            local anchor = (cn == "Model") and c.PrimaryPart or c
-                            if anchor then t = { anchor = anchor, cat = cat, t = now }; tracks[a] = t end
-                        end
-                    end
-                    if t then
-                        local okp, p = pcall(function() return t.anchor.Position end)
-                        if okp and p then
-                            if t.p then
-                                local d = p - t.p
-                                local dt = now - t.t
-                                if dt > 0 then t.v = d / dt end
-                                t.moving = (d.X * d.X + d.Y * d.Y + d.Z * d.Z) > MOVE2
-                            end
-                            t.p, t.t = p, now
-                        end
+                    local oka, ad = pcall(function() return c.Address end)
+                    if oka and ad and not tracks[ad] then
+                        local cn = c.ClassName
+                        local anchor = (cn == "Model") and c.PrimaryPart or c
+                        if anchor then tracks[ad] = { anchor = anchor, cat = cat, t = now, born = now, still = now } end
                     end
                 end
             end
         end
     end
     local out = {}
-    for a, t in pairs(tracks) do
-        if not seen[a] then tracks[a] = nil
-        elseif t.moving then out[#out + 1] = t end
+    for ad, t in pairs(tracks) do
+        local okp, p = pcall(function() return t.anchor.Position end)
+        if not (okp and p) or now - t.born > TRACK_MAXAGE then
+            tracks[ad] = nil
+        else
+            if t.p then
+                local d = p - t.p
+                local dt = now - t.t
+                if dt > 0 then t.v = d / dt end
+                t.moving = (d.X * d.X + d.Y * d.Y + d.Z * d.Z) > MOVE2
+            end
+            t.p, t.t = p, now
+            if t.moving then t.still = now end
+            if now - t.still > TRACK_IDLE then tracks[ad] = nil
+            elseif t.moving then out[#out + 1] = t end
+        end
     end
     list = out
 end
@@ -5134,14 +5280,14 @@ function MSL.start()
             local R = _G.SahurTanks
             if R and (R.epoch or 0) ~= mslEpoch then
                 mslEpoch = R.epoch or 0
-                tracks, list = {}, {}
+                tracks, list, lastN = {}, {}, {}
                 pcall(findContainers)
             end
-            if Config.Enabled then pcall(scan) elseif #list > 0 then list = {}; tracks = {} end
+            if Config.Enabled then local t0 = os.clock(); pcall(scan); local P = _G.SahurPerfAdd; if P then P("mslScan", t0) end elseif #list > 0 then list = {}; tracks = {} end
             task.wait(Config.Enabled and SCAN_EVERY or 0.5)
         end
     end)
-    conn = RunService.RenderStepped:Connect(function()
+    local function frameBody()
         local drawn = 0
         if Config.Enabled and #list > 0 then
             local me
@@ -5178,7 +5324,8 @@ function MSL.start()
         end
         for i = drawn + 1, lastDrawn do hideSlot(slots[i]) end
         lastDrawn = drawn
-    end)
+    end
+    conn = RunService.RenderStepped:Connect(function() local t0 = os.clock(); frameBody(); local P = _G.SahurPerfAdd; if P then P("msl", t0) end end)
     return MSL
 end
 function MSL.debug()
