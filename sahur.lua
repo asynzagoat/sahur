@@ -2705,7 +2705,8 @@ local Workspace = workspace
 local clock = os.clock
 local BUILD_BUDGET = 0.004
 local RR_PER_TICK  = 1
-local TICK         = 0.2
+local TICK         = 0.1
+local LIVE_EVERY   = 0.2
 local TEAM_EVERY   = 8
 local RESCAN_EVERY = 2
 local OCC_R        = 12
@@ -3049,6 +3050,7 @@ function R.start()
     local lastBeat = 0
     local inTankObj, inTankAt, svObj, svAt = nil, -1e9, nil, -1e9
     local buildQ = {}
+    local lastLive = -1e9
     local sec, secT = {}, 0
     local function lap(name) local t = clock(); sec[name] = (sec[name] or 0) + (t - secT) * 1000; secT = t end
     R.sec = sec
@@ -3101,6 +3103,24 @@ function R.start()
                 for fa, at in pairs(failAt) do if t0 >= at then failAt[fa] = nil; if R.byAddr[fa] == false then R.byAddr[fa] = nil end end end
                 local built = false
                 lap("kids")
+                local due = #kids ~= lastCount or t0 - lastRescan >= RESCAN_EVERY
+                    or (#buildQ > 0 and t0 - lastRescan > 1) or (pending and #buildQ == 0)
+                if due then
+                    buildQ = {}
+                    lastCount, lastRescan, pending = #kids, t0, false
+                    local seen, list = {}, {}
+                    for _, v in ipairs(kids) do
+                        local okv, a = pcall(function() return v.Address end)
+                        if okv and a then
+                            seen[a] = true
+                            local e = R.byAddr[a]
+                            if e == nil then buildQ[#buildQ + 1] = { a = a, v = v }
+                            elseif e then list[#list + 1] = e end
+                        end
+                    end
+                    for a in pairs(R.byAddr) do if not seen[a] then R.byAddr[a] = nil end end
+                    R.list = list
+                end
                 local tb = clock()
                 while #buildQ > 0 and (not built or clock() - tb < BUILD_BUDGET) do
                     local q = table.remove(buildQ, 1)
@@ -3118,27 +3138,13 @@ function R.start()
                         built = true
                     end
                 end
-                if #buildQ == 0 and (pending or #kids ~= lastCount or t0 - lastRescan >= RESCAN_EVERY) then
-                    lastCount, lastRescan, pending = #kids, t0, false
-                    local seen, list = {}, {}
-                    for _, v in ipairs(kids) do
-                        local okv, a = pcall(function() return v.Address end)
-                        if okv and a then
-                            seen[a] = true
-                            local e = R.byAddr[a]
-                            if e == nil then buildQ[#buildQ + 1] = { a = a, v = v }
-                            elseif e then list[#list + 1] = e end
-                        end
-                    end
-                    for a in pairs(R.byAddr) do if not seen[a] then R.byAddr[a] = nil end end
-                    R.list = list
-                end
                 if #buildQ > 0 then pending = true end
                 lap(built and "build" or "rescan")
                 R.myTank = R.myAddr and R.byAddr[R.myAddr] or nil
                 local list = R.list
                 local n = #list
-                if not built and n > 0 then
+                if not built and n > 0 and t0 - lastLive >= LIVE_EVERY then
+                    lastLive = t0
                     for _ = 1, math.min(RR_PER_TICK, n) do
                         rr = rr % n + 1
                         local e = list[rr]
@@ -3177,7 +3183,7 @@ function R.start()
                     tostring(A and A._frames), tostring(A and A._why),
                     tostring(H and H._frames), tostring(R.stats.tickErr), table.concat(parts, " ")))
             end
-            task.wait(pending and 0.1 or TICK)
+            task.wait(TICK)
         end
     end)
     return R
@@ -3936,6 +3942,7 @@ local gunName, curShellSrc = nil, nil
 local myVel, tauCtrl, lastT = nil, 0, 0
 local myVelSm = nil
 local reticleActive = false
+local lastBookT, IDLE_BOOK = -1e9, 0.05
 local TRIM_RATE   = 2.5
 local TRIM_MAX    = 0.015
 local TRIM_GATE   = 0.012
@@ -4020,13 +4027,14 @@ end
 local RET_HALF = 13
 local retFrame, retEpoch = nil, -1
 local retVpAt, retVpW, retVpH = -1e9, nil, nil
+local guiScale = nil
 local retParams, retParamsFor = nil, nil
 local SIGHT_FOV, SIGHT_DIST = 35, 12
 local sightFrame, sightVal = -1, false
 local function inSight()
-    local fr = Aim._frames or 0
-    if fr == sightFrame then return sightVal end
-    sightFrame = fr
+    local tNow = clock()
+    if tNow - sightFrame < 0.05 then return sightVal end
+    sightFrame = tNow
     local ok, s = pcall(function()
         local cam = workspace.CurrentCamera
         if cam.FieldOfView < SIGHT_FOV then return true end
@@ -4057,11 +4065,18 @@ local function reticlePoint()
     if now - retVpAt > 1 then
         retVpAt = now
         local okv, vp = pcall(function() return workspace.CurrentCamera.ViewportSize end)
-        if okv and vp then retVpW, retVpH = vp.X, vp.Y end
+        if okv and vp then
+            if retVpW and vp.X ~= retVpW then guiScale = nil end
+            retVpW, retVpH = vp.X, vp.Y
+        end
     end
-    local half = retVpW and (retVpW / 2 - p.X) or -1
-    if half < 5 or half > 60 then half = RET_HALF * ((retVpH or 1080) / 1080) end
-    return p.X + half, p.Y + half
+    if not guiScale and retVpW then
+        local raw = (retVpW / 2) / (p.X + RET_HALF)
+        local snap = floor(raw * 4 + 0.5) / 4
+        if snap >= 1 and snap <= 3 and abs(raw - snap) < 0.02 then guiScale = snap; Aim.guiScale = snap end
+    end
+    local sc = guiScale or 1
+    return (p.X + RET_HALF) * sc, (p.Y + RET_HALF) * sc
 end
 local addonCache, addonCacheN = {}, 0
 local function inAddons(inst)
@@ -4462,6 +4477,12 @@ function Aim.start()
             for k = #hullHist, 1, -1 do hullHist[k] = nil end
         end
         if not R or not R.myAddr or not muzzle then Aim._why = (R and R.myAddr) and "nomuzzle" or "notank"; fovCircle.Visible = false; readout.Visible = false; lock = nil; Aim.ring.on = false; return end
+        local nowF = clock()
+        local hot = Config.Enabled and (keyHeld(Config.Key) or nowF - keyDownAt <= KEY_GRACE + 0.3)
+        local now0 = nowF
+        if hot or nowF - lastBookT >= IDLE_BOOK then
+        local dtB = hot and dt or math.min(nowF - lastBookT, 0.1)
+        lastBookT = nowF
         pcall(pollGuns)
         local okc, cf = pcall(function() return muzzle.CFrame end)
         if not okc or not cf then fovCircle.Visible = false; Aim.ring.on = false; return end
@@ -4476,7 +4497,7 @@ function Aim.start()
                 local lk = mcf.LookVector
                 local fl = Vector3.new(lk.X, 0, lk.Z)
                 if fl.Magnitude > 0.01 then fl = fl.Unit end
-                local decay = exp(-dt / BOUNCE_HOLD)
+                local decay = exp(-dtB / BOUNCE_HOLD)
                 local nowH = clock()
                 local hb = hullHist
                 hb[#hb + 1] = { nowH, myUp, fl }
@@ -4499,14 +4520,15 @@ function Aim.start()
             if okv and av and av.Magnitude < 1 and wv and wv.Magnitude > 3 then okv = false end
             if Config.ClassicAim then okv = false end
             if okv and av and av.Magnitude < 400 then
-                local a = 1 - exp(-dt / 0.06)
+                local a = 1 - exp(-dtB / 0.06)
                 myVelSm = myVelSm and myVelSm:Lerp(av, a) or av
                 myVel = myVelSm
             else
                 myVel = wv
             end
         end
-        local okk, look = pcall(function() return workspace.CurrentCamera.CFrame.LookVector end)
+        local okk, look = false, nil
+        if hot then okk, look = pcall(function() return workspace.CurrentCamera.CFrame.LookVector end) else lastCamYaw = nil end
         if okk and look then
             local yaw = math.deg(math.atan2(look.X, look.Z))
             local pitch = math.deg(math.asin(math.max(-1, math.min(1, look.Y))))
@@ -4526,13 +4548,13 @@ function Aim.start()
             lastCamYaw, lastCamPitch = yaw, pitch
         end
         sentX, sentY = 0, 0
-        local now0 = clock()
         if loadedObj then
             local okl, lv = pcall(function() return loadedObj.Value end)
             if okl and (lv == "Unloaded" or lv == "" or lv == nil) then
                 lastUnloadedAt = now0
                 if Config.ReloadPause then reloadUntil = now0 + RELOAD_SETTLE end
             end
+        end
         end
         local reloading = now0 < reloadUntil
         local ringDist = 400
@@ -4564,7 +4586,7 @@ function Aim.start()
             Aim._why = lock and ("lock:" .. tostring(lock.e.name) .. (lock.goneAt and "(gone)" or "")) or (stickySpent and "spent" or "nolock")
             if inSight() then Aim._why = Aim._why .. "/sight" end
             if Aim._why ~= Aim._whyLogged then Aim._whyLogged = Aim._why; if R.bb then pcall(R.bb, "aim " .. Aim._why) end end
-            if lock then
+            if lock and not lock.goneAt then
                 local okm, massCF = pcall(function() return lock.e.mass.CFrame end)
                 if okm and massCF then trackVel(lock.e, massCF.Position, clock()) end
                 local okp, pos = false, nil
@@ -5179,7 +5201,7 @@ local floor, clock, sqrt = math.floor, os.clock, math.sqrt
 local WTS = WorldToScreen
 local V2 = Vector2.new
 local STUDS_TO_M = 1 / 2.7777778
-local SCAN_EVERY = 0.1
+local SCAN_EVERY = 0.15
 local MOVE2      = 4
 local INCOMING_COS = 0.96
 local POOL = 16
@@ -5225,49 +5247,60 @@ local function findContainers()
     local ok, f = pcall(function() return game:GetService("ReplicatedStorage").PHRST.Shells:FindFirstChild("PhysicalBullets") end)
     if ok and f then containers[#containers + 1] = f end
 end
-local lastN = {}
-local TAIL_BACK, TRACK_IDLE, TRACK_MAXAGE = 4, 1.5, 40
+local SCAN_WIN, TRACK_IDLE = 64, 1.5
+local known = {}
 local function scan()
     local now = clock()
-    for ci, cont in ipairs(containers) do
+    local alive = {}
+    for _, cont in ipairs(containers) do
         local ok, kids = pcall(function() return cont:GetChildren() end)
         if ok and kids then
-            local n, prev = #kids, lastN[ci]
-            local from = (prev and n >= prev) and (prev + 1 - TAIL_BACK) or (n - 12)
+            local n = #kids
+            local from = n - SCAN_WIN + 1
             if from < 1 then from = 1 end
-            lastN[ci] = n
             for i = from, n do
                 local c = kids[i]
-                local okn, nm = pcall(function() return c.Name end)
-                local cat = okn and nm and catOf(nm)
-                if cat then
-                    local oka, ad = pcall(function() return c.Address end)
-                    if oka and ad and not tracks[ad] then
-                        local cn = c.ClassName
-                        local anchor = (cn == "Model") and c.PrimaryPart or c
-                        if anchor then tracks[ad] = { anchor = anchor, cat = cat, t = now, born = now, still = now } end
+                local oka, ad = pcall(function() return c.Address end)
+                if oka and ad then
+                    local cat = known[ad]
+                    if cat == nil then
+                        local okn, nm = pcall(function() return c.Name end)
+                        cat = (okn and nm and catOf(nm)) or false
+                        known[ad] = cat
+                    end
+                    alive[ad] = true
+                    if cat then
+                        local t = tracks[ad]
+                        if not t then
+                            local okc, anchor = pcall(function()
+                                local cn = c.ClassName
+                                return (cn == "Model") and c.PrimaryPart or c
+                            end)
+                            if okc and anchor then t = { anchor = anchor, cat = cat, still = now }; tracks[ad] = t end
+                        end
+                        if t then
+                            local okp, pp = pcall(function() return t.anchor.Position end)
+                            if okp and pp then
+                                if t.p then
+                                    local d = pp - t.p
+                                    local dt = now - t.t
+                                    if dt > 0 then t.v = d / dt end
+                                    t.moving = (d.X * d.X + d.Y * d.Y + d.Z * d.Z) > MOVE2
+                                end
+                                t.p, t.t = pp, now
+                                if t.moving then t.still = now end
+                            end
+                        end
                     end
                 end
             end
         end
     end
+    for ad in pairs(known) do if not alive[ad] then known[ad] = nil end end
     local out = {}
     for ad, t in pairs(tracks) do
-        local okp, p = pcall(function() return t.anchor.Position end)
-        if not (okp and p) or now - t.born > TRACK_MAXAGE then
-            tracks[ad] = nil
-        else
-            if t.p then
-                local d = p - t.p
-                local dt = now - t.t
-                if dt > 0 then t.v = d / dt end
-                t.moving = (d.X * d.X + d.Y * d.Y + d.Z * d.Z) > MOVE2
-            end
-            t.p, t.t = p, now
-            if t.moving then t.still = now end
-            if now - t.still > TRACK_IDLE then tracks[ad] = nil
-            elseif t.moving then out[#out + 1] = t end
-        end
+        if not alive[ad] or now - t.still > TRACK_IDLE then tracks[ad] = nil
+        elseif t.moving and t.p then out[#out + 1] = t end
     end
     list = out
 end
@@ -5280,7 +5313,7 @@ function MSL.start()
             local R = _G.SahurTanks
             if R and (R.epoch or 0) ~= mslEpoch then
                 mslEpoch = R.epoch or 0
-                tracks, list, lastN = {}, {}, {}
+                tracks, list, known = {}, {}, {}
                 pcall(findContainers)
             end
             if Config.Enabled then local t0 = os.clock(); pcall(scan); local P = _G.SahurPerfAdd; if P then P("mslScan", t0) end elseif #list > 0 then list = {}; tracks = {} end
@@ -5300,7 +5333,7 @@ function MSL.start()
             for i = 1, #list do
                 if drawn >= POOL then break end
                 local t = list[i]
-                local ok, pos = pcall(function() return t.anchor.Position end)
+                local ok, pos = pcall(function() return t.p + (t.v or Vector3.new()) * (os.clock() - t.t) end)
                 if ok and pos then
                     local sp, vis = WTS(pos)
                     if vis and sp then
